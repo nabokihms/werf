@@ -177,6 +177,15 @@ func (s *DockerfileStage) DockerBuildArgs() []string {
 }
 
 func (s *DockerfileStage) calculateFilesHashsum(wildcards []string) (string, error) {
+	// if local git repository exists
+	// > Init git repository
+	// > Format globs
+	// > Create Path Filters
+	// > LsTreeChecksum
+	// > Calculate checksum of changed files (untracked, ...)
+	// else
+	// > old logic
+
 	var dependencies []string
 
 	for _, wildcard := range wildcards {

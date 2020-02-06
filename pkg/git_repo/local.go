@@ -61,8 +61,14 @@ func (repo *Local) CreateArchive(opts ArchiveOptions) (Archive, error) {
 	return repo.createArchive(repo.Path, repo.GitDir, repo.getRepoWorkTreeCacheDir(), opts)
 }
 
-func (repo *Local) Checksum(opts ChecksumOptions) (Checksum, error) {
-	return repo.checksum(repo.Path, repo.GitDir, repo.getRepoWorkTreeCacheDir(), opts)
+func (repo *Local) Checksum(opts ChecksumOptions) (checksum Checksum, err error) {
+	logboek.LogProcess("checksum", logboek.LogProcessOptions{}, func() error {
+		//checksum, err = repo.checksum(repo.Path, repo.GitDir, repo.getRepoWorkTreeCacheDir(), opts)
+		checksum, err = repo.checksumWithLsTree(repo.Path, repo.GitDir, repo.getRepoWorkTreeCacheDir(), opts)
+		return err
+	})
+
+	return
 }
 
 func (repo *Local) IsCommitExists(commit string) (bool, error) {

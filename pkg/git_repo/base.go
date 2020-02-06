@@ -5,6 +5,12 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"github.com/bmatcuk/doublestar"
+	"gopkg.in/src-d/go-billy.v4/osfs"
+	"gopkg.in/src-d/go-git.v4/plumbing/cache"
+	"gopkg.in/src-d/go-git.v4/plumbing/filemode"
+	"gopkg.in/src-d/go-git.v4/storage/filesystem"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,7 +18,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/bmatcuk/doublestar"
 	"github.com/flant/logboek"
 	"github.com/flant/werf/pkg/true_git"
 	"gopkg.in/src-d/go-git.v4"
@@ -591,4 +596,236 @@ func getFilesByPattern(baseDir, pathPattern string) ([]string, error) {
 
 func debugChecksum() bool {
 	return os.Getenv("WERF_DEBUG_GIT_REPO_CHECKSUM") == "1"
+}
+
+func (repo *Base) checksumWithLsTree(repoPath, gitDir, workTreeCacheDir string, opts ChecksumOptions) (Checksum, error) {
+	repository, err := git.PlainOpen(repoPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open repo `%s`: %s", repoPath, err)
+	}
+
+	commitHash, err := newHash(opts.Commit)
+	if err != nil {
+		return nil, fmt.Errorf("bad commit hash `%s`: %s", opts.Commit, err)
+	}
+
+	commit, err := repository.CommitObject(commitHash)
+	if err != nil {
+		return nil, fmt.Errorf("bad commit `%s`: %s", opts.Commit, err)
+	}
+
+	hasSubmodules, err := HasSubmodulesInCommit(commit)
+	if err != nil {
+		return nil, err
+	}
+
+	checksum := &ChecksumDescriptor{
+		NoMatchPaths: make([]string, 0),
+		Hash:         sha256.New(),
+	}
+
+	err = true_git.WithWorkTree(gitDir, workTreeCacheDir, opts.Commit, true_git.WithWorkTreeOptions{HasSubmodules: hasSubmodules}, func(worktreeDir string) error {
+		repositoryWithPreparedWorktree, err := GitOpenWithCustomWorktreeDir(gitDir, worktreeDir)
+		if err != nil {
+			return err
+		}
+
+		// TODO merge opts.Paths into opts.IncludePaths
+		pathFilter := NewLsTreePathFilter(
+			opts.BasePath,
+			append(opts.IncludePaths, opts.Paths...),
+			opts.ExcludePaths,
+		)
+
+		h, err := LsTreeChecksum(repositoryWithPreparedWorktree, pathFilter)
+		if err != nil {
+			return err
+		}
+
+		checksum.Hash = h
+		// TODO: checksum.NoMatchPaths
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if debugChecksum() {
+		logboek.LogF("Calculated checksum %s\n", checksum.String())
+	}
+
+	return checksum, nil
+}
+
+func GitOpenWithCustomWorktreeDir(gitDir string, worktreeDir string) (*git.Repository, error) {
+	worktreeFilesystem := osfs.New(worktreeDir)
+	storage := filesystem.NewStorage(osfs.New(gitDir), cache.NewObjectLRUDefault())
+	return git.Open(storage, worktreeFilesystem)
+}
+
+func LsTreeChecksum(repository *git.Repository, pathFilter *LsTreePathFilter) (hash.Hash, error) {
+	h := sha256.New()
+
+	ref, err := repository.Head()
+	if err != nil {
+		return nil, err
+	}
+
+	commit, err := repository.CommitObject(ref.Hash())
+	if err != nil {
+		return nil, err
+	}
+
+	tree, err := commit.Tree()
+	if err != nil {
+		return nil, err
+	}
+
+	if pathFilter.BasePath != "" {
+		basePath := filepath.ToSlash(pathFilter.BasePath)
+		entry, err := tree.FindEntry(basePath)
+		if err != nil {
+			return nil, err
+		}
+
+		// TODO: entry not found
+		// TODO: entry file
+
+		switch entry.Mode {
+		case filemode.Dir:
+			basePathTree, err := tree.Tree(basePath)
+			if err != nil {
+				return nil, err
+			}
+
+			tree = basePathTree
+		case filemode.Submodule:
+			submoduleRepository, submoduleTree, err := submoduleRepositoryAndTree(repository, basePath)
+			if err != nil {
+				return nil, err
+			}
+
+			repository = submoduleRepository
+			tree = submoduleTree
+		default:
+		}
+	}
+
+	if pathFilter.ShouldNotWalkThroughTree() {
+		h.Write([]byte(commit.Hash.String()))
+	} else {
+		if err = lsTreeChecksum(repository, tree, pathFilter.BasePath, pathFilter, h); err != nil {
+			return nil, err
+		}
+	}
+
+	return h, nil
+}
+
+func lsTreeChecksum(repository *git.Repository, tree *object.Tree, treePath string, pathFilter *LsTreePathFilter, h hash.Hash) error {
+	for _, entry := range tree.Entries {
+		entryPathRelativeToRepo := filepath.Join(treePath, entry.Name)
+
+		switch entry.Mode {
+		case filemode.Dir:
+			isValid, shouldGoInside := pathFilter.CheckEntry(entry.Name)
+
+			if !isValid {
+				logboek.LogDebugLn("Skip dir", entryPathRelativeToRepo)
+				continue
+			}
+
+			if !shouldGoInside {
+				logboek.LogDebugLn("Use dir hash", entryPathRelativeToRepo)
+
+				h.Write([]byte(entry.Hash.String()))
+				continue
+			} else {
+				logboek.LogDebugLn("Go into dir", entryPathRelativeToRepo)
+
+				entryTree, err := tree.Tree(entry.Name)
+				if err != nil {
+					return err
+				}
+
+				if err := pathFilter.WithoutEntryInPaths(entry.Name, func() error {
+					return lsTreeChecksum(repository, entryTree, entryPathRelativeToRepo, pathFilter, h)
+				}); err != nil {
+					return err
+				}
+			}
+		case filemode.Submodule:
+			isValid, shouldGoInside := pathFilter.CheckEntry(entry.Name)
+
+			if !isValid {
+				logboek.LogDebugLn("Skip submodule", entryPathRelativeToRepo)
+				continue
+			}
+
+			if !shouldGoInside {
+				logboek.LogDebugLn("Use submodule hash", entryPathRelativeToRepo)
+
+				h.Write([]byte(entry.Hash.String()))
+				continue
+			} else {
+				logboek.LogDebugLn("Go into submodule", entryPathRelativeToRepo)
+
+				submoduleRepository, submoduleTree, err := submoduleRepositoryAndTree(repository, entryPathRelativeToRepo)
+				if err != nil {
+					return err
+				}
+
+				if err := pathFilter.WithoutEntryInPaths(entry.Name, func() error {
+					return lsTreeChecksum(submoduleRepository, submoduleTree, entryPathRelativeToRepo, pathFilter, h)
+				}); err != nil {
+					return err
+				}
+			}
+		default:
+			if pathFilter.IsFilePathValid(entryPathRelativeToRepo) {
+				logboek.LogDebugLn("Add file", entryPathRelativeToRepo)
+				h.Write([]byte(entry.Hash.String()))
+			} else {
+				logboek.LogDebugLn("Skip file", entryPathRelativeToRepo)
+			}
+		}
+	}
+
+	return nil
+}
+
+func submoduleRepositoryAndTree(repository *git.Repository, submoduleName string) (*git.Repository, *object.Tree, error) {
+	worktree, err := repository.Worktree()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	submodule, err := worktree.Submodule(submoduleName)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	submoduleRepository, err := submodule.Repository()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ref, err := submoduleRepository.Head()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	commit, err := submoduleRepository.CommitObject(ref.Hash())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	submoduleTree, err := commit.Tree()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return submoduleRepository, submoduleTree, nil
 }
